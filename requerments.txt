@@ -1,0 +1,4 @@
+pip install torch torchvision transformers timm
+pip install groundingdino
+pip install opencv-python scikit-learn
+pip install pycocotools pillow
