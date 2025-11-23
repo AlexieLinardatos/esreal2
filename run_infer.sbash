@@ -1,0 +1,129 @@
+#!/bin/bash
+#SBATCH --job-name=esreal_infer
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --output=%x-%j.out
+
+set -e
+
+#########################
+# CONFIG - EDIT IF NEEDED
+#########################
+
+# GitHub repo with your ESREAL2 code
+REPO_URL="https://github.com/AlexieLinardatos/ESREAL2.git"
+REPO_NAME="ESREAL2"
+
+# Hugging Face dataset repo (COCO 2014 mirror)
+HF_DATASET_URL="https://huggingface.co/datasets/AlexieLinardatos/esreal-dataset"
+
+# Hugging Face weights repo (GroundingDINO + others)
+HF_WEIGHTS_URL="https://huggingface.co/AlexieLinardatos/myDino"
+
+# Conda env name (from environment_lavis.yml)
+ENV_NAME="lavis"
+
+#########################
+# 1) Modules + Conda
+#########################
+
+# If this module doesn't exist, it's fine; conda will still work
+module load python/3.10 2>/dev/null || true
+module load git-lfs 2>/dev/null || true
+git lfs install || true
+
+# Your miniconda install path on CC (adjust if different)
+source ~/miniconda3/etc/profile.d/conda.sh
+
+#########################
+# 2) Get / update code
+#########################
+
+CODE_DIR="$SCRATCH/$REPO_NAME"
+
+if [ ! -d "$CODE_DIR" ]; then
+    echo "[INFO] Cloning ESREAL2 into $CODE_DIR"
+    git clone "$REPO_URL" "$CODE_DIR"
+else
+    echo "[INFO] Updating ESREAL2 in $CODE_DIR"
+    cd "$CODE_DIR"
+    git pull
+fi
+
+cd "$CODE_DIR"
+
+#########################
+# 3) Conda environment
+#########################
+
+if ! conda env list | grep -q " ${ENV_NAME} "; then
+    echo "[INFO] Creating conda env '${ENV_NAME}' from environment_lavis.yml"
+    conda env create -n "${ENV_NAME}" -f environment_lavis.yml
+fi
+
+echo "[INFO] Activating env '${ENV_NAME}'"
+conda activate "${ENV_NAME}"
+
+#########################
+# 4) Dataset from HF
+#########################
+
+# We want: ESREAL2/dataset/data/coco/...
+DATASET_DIR="$CODE_DIR/dataset"
+
+if [ ! -d "$DATASET_DIR" ]; then
+    echo "[INFO] Cloning dataset from Hugging Face into $DATASET_DIR"
+    git lfs clone "$HF_DATASET_URL" "$DATASET_DIR"
+fi
+
+# Your CSV is already in the repo root with paths like "dataset/data/..."
+DF_PATH="$CODE_DIR/esreal_data.csv"
+IMAGE_DIR="$CODE_DIR"    # not actually used by EsrealImageDataset
+
+#########################
+# 5) Weights from HF
+#########################
+
+# We want: ESREAL2/weights/...
+WEIGHTS_DIR="$CODE_DIR/weights"
+
+if [ ! -d "$WEIGHTS_DIR" ]; then
+    echo "[INFO] Cloning weights from Hugging Face into $WEIGHTS_DIR"
+    git lfs clone "$HF_WEIGHTS_URL" "$WEIGHTS_DIR"
+fi
+
+# Optional: if reward_local.py reads this env var, it will also work
+export ESREAL_WEIGHTS="$WEIGHTS_DIR"
+
+#########################
+# 6) Output + state
+#########################
+
+OUT_DIR="$SCRATCH/esreal_outputs"
+mkdir -p "$OUT_DIR"
+
+STATE_PATH="$OUT_DIR/state.json"
+
+#########################
+# 7) Run inference
+#########################
+
+# TODO: set this path if/when infer.py actually needs a model checkpoint.
+TARGET_CKPT=""
+
+echo "[INFO] Starting infer.py ..."
+python infer.py \
+  --target_checkpoint "$TARGET_CKPT" \
+  --save_dir "$OUT_DIR" \
+  --save_filename "blip2_flant5xl.jsonl" \
+  --start_index 0 \
+  --interval 1 \
+  --df_path "$DF_PATH" \
+  --image_dir "$IMAGE_DIR" \
+  --state_path "$STATE_PATH" \
+  --save_every 100
+
+echo "[INFO] Inference finished."
+echo "[INFO] Outputs in: $OUT_DIR"

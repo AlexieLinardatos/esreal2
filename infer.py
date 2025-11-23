@@ -1,39 +1,36 @@
-
-import os
-import gc
-import json
-from typing import Optional
-import pandas as pd
-
+# at top (new imports)
+import os, json, signal, sys
+from typing import Optional, Set
 import fire
-import torch
+# ... keep your existing imports ...
 
-from PIL import Image
-from tqdm import tqdm
+def _load_state(state_path: Optional[str]) -> dict:
+    if not state_path or not os.path.exists(state_path):
+        return {"next_index": None, "done_ids": []}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"next_index": None, "done_ids": []}
 
-from accelerate import Accelerator
+def _save_state(state_path: Optional[str], state: dict) -> None:
+    if not state_path:
+        return
+    tmp = state_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_path)
 
-from lavis.models import load_model_and_preprocess
-from torch.utils.data import DataLoader, Subset, Dataset
+def _append_jsonl(path: str, obj: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
 
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
-
-class EsrealImageDataset(Dataset):
-    def __init__(self, df_path, image_dir):
-        self.df = pd.read_csv(df_path)
-        self.image_dir = image_dir  # kept for future use if you ever need to join paths
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        return {
-            "image_id": idx,
-            "image_path": row["image_path"],  # path in CSV should already be absolute/relative
-        }
-
-    def __len__(self):
-        return len(self.df)
-
+def _determine_range(n_rows: int, start_index: int, interval: int) -> range:
+    if interval and interval > 0:
+        end = min(n_rows, start_index + interval)
+    else:
+        end = n_rows
+    return range(start_index, end)
 
 def main(
     target_checkpoint: Optional[str],
@@ -42,228 +39,85 @@ def main(
     start_index: int,
     interval: int,
     df_path: str,
-    image_dir: str,  # kept for signature parity (not used directly here)
-    prompt: str,
-    batch_size: int,
-    num_workers: int,
+    image_dir: str,
+    state_path: Optional[str] = None,
+    save_every: int = 50,
 ):
-    # create accelerator
-    accelerator = Accelerator()
-    print("accelerate device:", accelerator.device)
-    print("cuda available:", torch.cuda.is_available())
-
-    # load model
-    model, vis_processors, _ = load_model_and_preprocess(
-        name="blip2_t5_instruct",
-        model_type="flant5xl",
-        is_eval=True,
-    )
-
-    if target_checkpoint is not None and str(target_checkpoint).lower() != "none":
-        model.load_state_dict(torch.load(target_checkpoint, map_location="cpu"), strict=False)
-
-    # tokenizer
-    t5_tokenizer = model.t5_tokenizer
-
-    # dataset / loader
-    full_dataset = EsrealImageDataset(df_path, image_dir)
-    max_size = len(full_dataset)
-    test_dataset = Subset(full_dataset, range(start_index, min(start_index + interval, max_size)))
-    # On Windows, num_workers=0 avoids multiprocessing issues
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
-
-    # prepare accelerator
-    model, test_dataloader = accelerator.prepare(model, test_dataloader)
     os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, save_filename)
 
-    # Final output path (single chunk for this slice)
-    chunk_name = save_filename.replace(".jsonl", f"__{start_index}__{min(start_index + interval, max_size)}.jsonl")
-    save_path = os.path.join(save_dir, chunk_name)
+    dataset = EsrealImageDataset(df_path=df_path, image_dir=image_dir)
+    n_rows = len(dataset)
 
-    # If resuming, you may choose to remove existing file or keep appending.
-    # Here we start fresh for this slice:
-    if accelerator.is_main_process and os.path.exists(save_path):
-        os.remove(save_path)
+    # ---- load state (resume) ----
+    state = _load_state(state_path)
+    done_ids: Set[int] = set(state.get("done_ids", []))
 
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader):
-            # handle list vs tensor ids robustly
-            image_ids = batch["image_id"]
-            if hasattr(image_ids, "tolist"):
-                image_ids = image_ids.tolist()
+    if state.get("next_index") is not None:
+        start_index = max(start_index, int(state["next_index"]))
 
-            image_paths = batch["image_path"]
+    work_range = _determine_range(n_rows, start_index, interval)
 
-            # load & preprocess images
-            proc_images = []
-            for p in image_paths:
-                with Image.open(p).convert("RGB") as im:
-                    proc_images.append(vis_processors["eval"](im))
-            images = torch.stack(proc_images).to(accelerator.device)
+    # ---- graceful shutdown hooks ----
+    stopped = {"flag": False}
+    def _handle_stop(signum, frame):
+        stopped["flag"] = True
+        print(f"\n[signal {signum}] received -> will save state and exit...", file=sys.stderr)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_stop)
+        except Exception:
+            pass  # some platforms may not allow setting handlers
 
-            # generate (keep it shorter/faster if you like with max_length)
-            outputs = accelerator.unwrap_model(model).generate(
-                samples={"image": images, "prompt": [prompt] * images.shape[0]},
-                top_p=1.0,
-                # max_length=32,  # uncomment to speed up / shorten outputs
-                # temperature=0.7,
-            )
+    # ---- load your model(s) (example with LAVIS; adjust as needed) ----
+    accelerator = Accelerator()
+    device = accelerator.device
+    # Example:
+    # model, vis_processors, txt_processors = load_model_and_preprocess(
+    #     name="blip_caption", model_type="base_coco", is_eval=True, device=device
+    # )
 
-            # safe decode (LAVIS may already return strings)
-            if isinstance(outputs[0], str):
-                output_texts = outputs
-            else:
-                output_texts = t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    # ---- iterate with periodic saves ----
+    processed_since_save = 0
+    last_index = start_index
 
-            # stream-append this batch to disk
-            if accelerator.is_main_process:
-                with open(save_path, "a", encoding="utf-8") as f:
-                    for i, t in zip(image_ids, output_texts):
-                        json.dump({"image_id": int(i), "caption": t}, f, ensure_ascii=False)
-                        f.write("\n")
+    try:
+        for idx in tqdm(work_range, desc="ESREAL Inference"):
+            if idx in done_ids:
+                last_index = idx + 1
+                continue
 
-            torch.cuda.empty_cache()
-            gc.collect()
+            sample = dataset[idx]
+            img_path = sample["image_path"]
 
-    if accelerator.is_main_process:
-        print(f"✅ Wrote captions to: {save_path}")
+            # --- YOUR INFERENCE HERE ---
+            # image = Image.open(img_path).convert("RGB")
+            # result = model.generate(...)  # placeholder
+            result = {"image_id": idx, "image_path": img_path, "pred": "TODO"}  # stub
 
+            _append_jsonl(out_path, result)
+            done_ids.add(idx)
+            processed_since_save += 1
+            last_index = idx + 1
+
+            # periodic state flush
+            if processed_since_save >= max(1, save_every):
+                _save_state(state_path, {"next_index": last_index, "done_ids": sorted(done_ids)})
+                processed_since_save = 0
+
+            if stopped["flag"]:
+                break
+
+    except KeyboardInterrupt:
+        print("\n[KeyboardInterrupt] stopping...", file=sys.stderr)
+
+    finally:
+        # final save
+        _save_state(state_path, {"next_index": last_index, "done_ids": sorted(done_ids)})
+        print(f"State saved to {state_path}. Next index: {last_index}")
 
 if __name__ == "__main__":
     fire.Fire(main)
 
 
-
-
-
-
-# import os
-# import gc
-# import json
-# from typing import Optional
-# import pandas as pd
-
-# import fire
-# import torch
-# import torch.distributed as dist
-
-# from PIL import Image
-# from tqdm import tqdm
-
-# from accelerate import Accelerator
-
-# from lavis.datasets.builders import load_dataset
-# from lavis.models import load_model_and_preprocess
-# from lavis.models import model_zoo
-# from torch.utils.data import DataLoader, Subset, Dataset
-
-# os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
-
-# class EsrealImageDataset(Dataset):
-#     def __init__(self, df_path, image_dir):
-#         self.df = pd.read_csv(df_path)
-#         self.image_dir = image_dir
-
-#     def __getitem__(self, idx):
-#         row = self.df.iloc[idx]
-#         return {
-#             "image_id": idx,
-#             "image_path": row["image_path"],
-#         }
-
-#     def __len__(self):
-#         return len(self.df)
-
-# def main(
-#     target_checkpoint: Optional[str],
-#     save_dir: str,
-#     save_filename: str,
-#     start_index: int,
-#     interval: int,
-#    # dataset_name: str,
-#     df_path: str,
-#     image_dir: str,
-#     prompt: str,
-#     batch_size: int,
-#     num_workers: int,
-# ):
-#     # create accelerator
-#     accelerator = Accelerator()
-
-#     # load model
-#     model, vis_processors, _ = load_model_and_preprocess(
-#         name="blip2_t5_instruct", 
-#         #name="blip2_t5_instruct_lora_with_value_head",
-#         model_type="flant5xl",
-#         is_eval=True,
-#     )
-
-#     if target_checkpoint is not None:
-#         model.load_state_dict(torch.load(target_checkpoint, map_location="cpu"), strict=False)
-
-#     # load tokenizer
-#     t5_tokenizer = model.t5_tokenizer
-#     tokenized = t5_tokenizer(prompt, return_tensors="pt")
-
-#     # load dataset
-#     full_dataset = EsrealImageDataset(df_path, image_dir)
-#     max_size = len(full_dataset)
-#     test_dataset = Subset(full_dataset, range(start_index, min(start_index + interval, max_size)))
-#     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
-
-#     # prepare accelerator
-#     model, test_dataloader = accelerator.prepare(model, test_dataloader)
-
-#     # inference
-#     inference_results = []
-
-#     with torch.no_grad():
-#         for batch in tqdm(test_dataloader):
-#             image_ids = batch["image_id"].tolist()
-#             image_paths = batch["image_path"]
-#             images = [vis_processors["eval"](Image.open(image_path).convert("RGB")) for image_path in image_paths]
-#             images = torch.stack(images).to(accelerator.device)
-#             input_ids = tokenized.input_ids.repeat_interleave(images.shape[0], dim=0).to(accelerator.device)
-#             outputs = accelerator.unwrap_model(model).generate(
-#                 samples={"image": images, "prompt": [prompt] * images.shape[0]},
-#                 top_p=1.0,
-#             )
-#             if isinstance(outputs[0], str):
-#                 output_texts = outputs  # Already decoded
-#             else:
-#                 output_texts = t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-#             inference_results.extend(
-#                 [
-#                     {"image_id": image_id, "caption": output_text}
-#                     for image_id, output_text in zip(image_ids, output_texts)
-#                 ]
-#             )
-
-#             torch.cuda.empty_cache()
-#             gc.collect()
-
-#     # gather results
-#     if accelerator.is_main_process:
-#         gathered_results = [None] * dist.get_world_size()
-#         dist.gather_object(inference_results, gathered_results)
-#     else:
-#         dist.gather_object(inference_results)
-
-#     # save results
-#     if accelerator.is_main_process:
-#         # reformat gathered_results
-#         final_results = []
-#         for res in gathered_results:
-#             final_results.extend(res)
-#         if interval < BIG_NUMBER:
-#             save_filename = save_filename.replace(".jsonl", f"__{start_index}__{start_index + interval}.jsonl")
-#         save_path = os.path.join(save_dir, save_filename)
-#         with open(save_path, "w") as f:
-#             for item in final_results:
-#                 json.dump(item, f, ensure_ascii=False)
-#                 f.write("\n")
-
-
-# if __name__ == "__main__":
-#     fire.Fire(main)
+    
