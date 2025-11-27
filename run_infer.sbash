@@ -73,17 +73,20 @@ conda activate "${ENV_NAME}"
 ###############
 # HF AUTH
 ###############
+#########################
+# 4) Dataset from HF
+#########################
 
-# TOKEN FOR PRIVATE DATASET
-export HF_DATASET_TOKEN="PASTE_DATASET_TOKEN_HERE"
+###############
+# HF AUTH
+###############
 
-# TOKEN FOR PRIVATE WEIGHTS (GroundingDINO)
-export HF_WEIGHTS_TOKEN="PASTE_WEIGHTS_TOKEN_HERE"
+# Expect tokens to already be set in the environment
+: "${HF_DATASET_TOKEN:?HF_DATASET_TOKEN is not set}"
+: "${HF_WEIGHTS_TOKEN:?HF_WEIGHTS_TOKEN is not set}"
 
-# Configure Git to use stored credentials automatically
 git config --global credential.helper store
 
-# Write BOTH tokens into ~/.git-credentials
 cat <<EOF > ~/.git-credentials
 https://$HF_DATASET_TOKEN:@huggingface.co
 https://$HF_WEIGHTS_TOKEN:@huggingface.co
@@ -93,7 +96,6 @@ EOF
 # DOWNLOAD DATASET
 ###############
 
-# We want: ESREAL2/dataset/data/coco/...
 DATASET_DIR="$CODE_DIR/dataset"
 
 if [ ! -d "$DATASET_DIR" ]; then
@@ -101,9 +103,10 @@ if [ ! -d "$DATASET_DIR" ]; then
     git lfs clone "$HF_DATASET_URL" "$DATASET_DIR"
 fi
 
-# Your CSV is already in the repo root with paths like "dataset/data/..."
 DF_PATH="$CODE_DIR/esreal_data.csv"
-IMAGE_DIR="$CODE_DIR"    # not actually used by EsrealImageDataset
+IMAGE_DIR="$CODE_DIR"
+
+
 #########################
 # 5) Weights from HF
 #########################
