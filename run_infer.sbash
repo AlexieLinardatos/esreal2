@@ -9,7 +9,6 @@
 
 
 
-
 set -e
 
 #########################
@@ -20,25 +19,44 @@ set -e
 REPO_URL="https://github.com/AlexieLinardatos/ESREAL2.git"
 REPO_NAME="ESREAL2"
 
-# Hugging Face dataset repo (COCO 2014 mirror)
+# Hugging Face dataset repo (COCO / ESREAL dataset)
 HF_DATASET_URL="https://huggingface.co/datasets/AlexieLinardatos/esreal-dataset"
 
-# Hugging Face weights repo (GroundingDINO + others)
+# Hugging Face weights repo (GroundingDINO + SDXL etc.)
 HF_WEIGHTS_URL="https://huggingface.co/AlexieLinardatos/myDino"
 
-# Conda env name (from environment_lavis.yml)
+# LAVIS / ESREAL conda env name
 ENV_NAME="lavis"
+
+# Lavis dataset builder name used by infer.py and train.py
+# 👉 CHANGE THIS to whatever your custom builder is called
+DATASET_NAME="esreal_dataset"    # placeholder
+
+# Prompt used in infer.py for BLIP2
+# (you can also pass this in from the command line instead)
+INFER_PROMPT="Describe this image in detail."
+
+# PPO / training hyperparams (tweak as you like)
+BATCH_SIZE=4
+CHUNK_SIZE=4
+LR=1e-5
+SEQ_LENGTH=256
+MAX_NEW_TOKENS=64
+REPETITION_PENALTY=1.2
+INIT_KL_COEF=0.05
+ALPHA=1.0
+IS_REC_PENALTY=true
+TASK_NAME="short_caption"
+EXPERIMENT_NAME="esreal_run1"
 
 #########################
 # 1) Modules + Conda
 #########################
 
-# If this module doesn't exist, it's fine; conda will still work
 module load python/3.10 2>/dev/null || true
-module load git-lfs 2>/dev/null || true
+module load git-lfs       2>/dev/null || true
 git lfs install || true
 
-# Your miniconda install path on CC (adjust if different)
 source ~/miniconda3/etc/profile.d/conda.sh
 
 #########################
@@ -71,21 +89,12 @@ echo "[INFO] Activating env '${ENV_NAME}'"
 conda activate "${ENV_NAME}"
 
 #########################
-# 4) Dataset from HF
+# 4) Hugging Face auth
 #########################
 
-###############
-# HF AUTH
-###############
-#########################
-# 4) Dataset from HF
-#########################
-
-###############
-# HF AUTH
-###############
-
-# Expect tokens to already be set in the environment
+# These must be set in your environment before sbatch:
+#   export HF_DATASET_TOKEN=...
+#   export HF_WEIGHTS_TOKEN=...
 : "${HF_DATASET_TOKEN:?HF_DATASET_TOKEN is not set}"
 : "${HF_WEIGHTS_TOKEN:?HF_WEIGHTS_TOKEN is not set}"
 
@@ -96,9 +105,12 @@ https://$HF_DATASET_TOKEN:@huggingface.co
 https://$HF_WEIGHTS_TOKEN:@huggingface.co
 EOF
 
-###############
-# DOWNLOAD DATASET
-###############
+# This is what gdino_registry.py expects
+export HF_TOKEN="$HF_WEIGHTS_TOKEN"
+
+#########################
+# 5) Download dataset
+#########################
 
 DATASET_DIR="$CODE_DIR/dataset"
 
@@ -107,15 +119,14 @@ if [ ! -d "$DATASET_DIR" ]; then
     git lfs clone "$HF_DATASET_URL" "$DATASET_DIR"
 fi
 
-DF_PATH="$CODE_DIR/esreal_data.csv"
-IMAGE_DIR="$CODE_DIR"
-
+# Adjust these to match how your HF dataset is laid out
+DF_PATH="$DATASET_DIR/esreal_data.csv"   # or images.csv / whatever you use
+IMAGE_DIR="$DATASET_DIR"                 # or "$DATASET_DIR/data/coco/..." etc.
 
 #########################
-# 5) Weights from HF
+# 6) Download weights
 #########################
 
-# We want: ESREAL2/weights/...
 WEIGHTS_DIR="$CODE_DIR/weights"
 
 if [ ! -d "$WEIGHTS_DIR" ]; then
@@ -123,36 +134,71 @@ if [ ! -d "$WEIGHTS_DIR" ]; then
     git lfs clone "$HF_WEIGHTS_URL" "$WEIGHTS_DIR"
 fi
 
-# Optional: if reward_local.py reads this env var, it will also work
+# Some parts of your code may still look at this
 export ESREAL_WEIGHTS="$WEIGHTS_DIR"
 
 #########################
-# 6) Output + state
+# 7) Output + state
 #########################
 
 OUT_DIR="$SCRATCH/esreal_outputs"
 mkdir -p "$OUT_DIR"
 
 STATE_PATH="$OUT_DIR/state.json"
+CAPTIONS_JSONL="$OUT_DIR/blip2_flant5xl.jsonl"
 
 #########################
-# 7) Run inference
+# 8) Run infer.py (image -> text)
 #########################
 
-# TODO: set this path if/when infer.py actually needs a model checkpoint.
-TARGET_CKPT=""
+TARGET_CKPT=""   # leave empty if you’re using the base BLIP2 weights
 
 echo "[INFO] Starting infer.py ..."
+
 python infer.py \
   --target_checkpoint "$TARGET_CKPT" \
   --save_dir "$OUT_DIR" \
-  --save_filename "blip2_flant5xl.jsonl" \
+  --save_filename "$(basename "$CAPTIONS_JSONL")" \
   --start_index 0 \
-  --interval 1 \
+  --interval 10000000 \
+  --dataset_name "$DATASET_NAME" \
   --df_path "$DF_PATH" \
   --image_dir "$IMAGE_DIR" \
+  --prompt "$INFER_PROMPT" \
+  --batch_size "$BATCH_SIZE" \
+  --num_workers 4 \
   --state_path "$STATE_PATH" \
-  --save_every 100
+  --save_every 500
 
 echo "[INFO] Inference finished."
-echo "[INFO] Outputs in: $OUT_DIR"
+echo "[INFO] Captions written to: $CAPTIONS_JSONL"
+
+#########################
+# 9) Run train.py (PPO + local reward)
+#########################
+
+CHECKPOINT_DIR="$OUT_DIR/checkpoints"
+
+echo "[INFO] Starting train.py (PPO)..."
+
+python train.py \
+  --model_path "Salesforce/blip2-flan-t5-xl" \
+  --dataset_name "$DATASET_NAME" \
+  --df_path "$DF_PATH" \
+  --image_dir "$IMAGE_DIR" \
+  --task_name "$TASK_NAME" \
+  --batch_size "$BATCH_SIZE" \
+  --chunk_size "$CHUNK_SIZE" \
+  --lr "$LR" \
+  --seq_length "$SEQ_LENGTH" \
+  --max_new_tokens "$MAX_NEW_TOKENS" \
+  --repetition_penalty "$REPETITION_PENALTY" \
+  --init_kl_coef "$INIT_KL_COEF" \
+  --alpha "$ALPHA" \
+  --is_rec_penalty "$IS_REC_PENALTY" \
+  --checkpoint_dir "$CHECKPOINT_DIR" \
+  --experiment_name "$EXPERIMENT_NAME" \
+  --resume_from_checkpoint ""
+
+echo "[INFO] Training finished."
+echo "[INFO] Checkpoints in: $CHECKPOINT_DIR"

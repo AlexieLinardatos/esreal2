@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import functools
 import time
@@ -7,22 +8,28 @@ from typing import List
 
 import torch
 import numpy as np
-#import tritonclient.http as httpclient
-#from tritonclient.utils import np_to_triton_dtype
 
 from lavis.datasets.builders import load_dataset
 from lavis.models import load_model_and_preprocess
 
 import trlx
-#from trlx.data.default_configs import (
-#    TRLConfig,
-#    TrainConfig,
-#    TokenizerConfig,
-#    OptimizerConfig,
-#    SchedulerConfig,
-#    PPOConfig,
-#)
-#from trlx.data.configs import NNModelConfig
+from trlx.data.default_configs import (
+    TRLConfig,
+    TrainConfig,
+    TokenizerConfig,
+    OptimizerConfig,
+    SchedulerConfig,
+    PPOConfig,
+)
+from trlx.data.configs import NNModelConfig
+
+# For converting tensors -> PIL for the reward pipeline
+from torchvision import transforms as T
+
+# Make sure we can import reward_model.* if this lives in GroundingDINO/
+sys.path.append(os.path.dirname(__file__))
+
+from reward_model.registry import registry  # your local ESREAL reward registry
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -35,6 +42,7 @@ def timeit(func):
         end_time = time.perf_counter()
         print(f"Function '{func.__name__}' took: {end_time - start_time:.4f} seconds")
         return result
+
     return wrapper
 
 
@@ -62,13 +70,19 @@ def default_ppo_config(model, model_copy, args):
             tokenizer_path=args.model_path,
             padding_side="left",
             truncation_side="right",
-        ), 
+        ),
         optimizer=OptimizerConfig(
             name="adamw",
-            kwargs=dict(lr=args.lr, betas=(0.9, 0.95), eps=1.0e-8, weight_decay=1.0e-6),
+            kwargs=dict(
+                lr=args.lr,
+                betas=(0.9, 0.95),
+                eps=1.0e-8,
+                weight_decay=1.0e-6,
+            ),
         ),
         scheduler=SchedulerConfig(
-            name="cosine_annealing", kwargs=dict(T_max=1e12, eta_min=3e-5)
+            name="cosine_annealing",
+            kwargs=dict(T_max=1e12, eta_min=3e-5),
         ),
         method=PPOConfig(
             name="PPOConfig",
@@ -100,84 +114,17 @@ def create_reference_model(model):
     return ref_model.eval()
 
 
-def single_request_reward_model(
-        images: np.ndarray,
-        prompt: np.ndarray,
-        tokenized_prompt: List[str],
-        triton_server_url: str,
-    ):
-    tokenized_prompt = np.array(tokenized_prompt, dtype=np.object_)[None, :]  # (1, T)
-
-    with httpclient.InferenceServerClient(triton_server_url, network_timeout=600) as client:
-        inputs = [
-            httpclient.InferInput("IMAGE", images.shape, np_to_triton_dtype(images.dtype)),
-            httpclient.InferInput("PROMPT", prompt.shape, np_to_triton_dtype(prompt.dtype)),
-            httpclient.InferInput("TOKENIZED_PROMPT", tokenized_prompt.shape, np_to_triton_dtype(tokenized_prompt.dtype)),
-        ]
-        inputs[0].set_data_from_numpy(images)
-        inputs[1].set_data_from_numpy(prompt)
-        inputs[2].set_data_from_numpy(tokenized_prompt)
-
-        outputs = [
-            httpclient.InferRequestedOutput("MEAN_REC_REWARD"),
-            httpclient.InferRequestedOutput("MEAN_OBJ_PENALTY"),
-            httpclient.InferRequestedOutput("MEAN_ATT_PENALTY"),
-            httpclient.InferRequestedOutput("MEAN_REL_PENALTY"),
-            httpclient.InferRequestedOutput("MEAN_POS_PENALTY"),
-        ]
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                result = client.infer("reward_model", inputs, request_id=str(1), outputs=outputs)
-                mean_rec_reward = result.as_numpy("MEAN_REC_REWARD").squeeze().tolist()
-                mean_obj_penalty = result.as_numpy("MEAN_OBJ_PENALTY").squeeze().tolist()
-                mean_att_penalty = result.as_numpy("MEAN_ATT_PENALTY").squeeze().tolist()
-                mean_rel_penalty = result.as_numpy("MEAN_REL_PENALTY").squeeze().tolist()
-                mean_pos_penalty = result.as_numpy("MEAN_POS_PENALTY").squeeze().tolist()
-                return mean_rec_reward, mean_obj_penalty, mean_att_penalty, mean_rel_penalty, mean_pos_penalty
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f'Retrying due to error: {e}')
-                    continue
-                else:
-                    raise e
-    return mean_rec_reward, mean_obj_penalty, mean_att_penalty, mean_rel_penalty, mean_pos_penalty
-
-
-def request_reward_model(
-    total_images: np.array,
-    total_prompts: List[str],
-    total_tokenized_prompts: List[List[str]],
-    triton_server_url: str,
-):
-    if getattr(request_reward_model, "pool", None) is None:
-        from multiprocessing.pool import Pool
-        request_reward_model.pool = Pool(16)
-    pool = request_reward_model.pool
-    total_images = total_images[:, None]  # (N, 1, 3, 224, 224)
-    total_prompts = np.array(total_prompts, dtype=np.object_)[:, None][:, None]  # (N, 1, 1)
-
-    mean_rec_reward, mean_obj_penalty, mean_att_penalty, mean_rel_penalty, mean_pos_penalty = zip(
-        *pool.starmap(
-            single_request_reward_model, zip(
-                total_images,
-                total_prompts,
-                total_tokenized_prompts,
-                [triton_server_url] * len(total_images),
-            )
-        )
-    )
-    return mean_rec_reward, mean_obj_penalty, mean_att_penalty, mean_rel_penalty, mean_pos_penalty
-
-
 def main(args):
     dataset_name = args.dataset_name
-    triton_server_url = args.triton_server_url
     alpha = args.alpha
     is_rec_penalty = args.is_rec_penalty
 
+    # device index for LAVIS model (-1 = CPU)
     device = int(os.environ.get("LOCAL_RANK", 0)) if torch.cuda.is_available() else -1
 
+    # -------------------------------
+    # 1) Load BLIP2 + value head
+    # -------------------------------
     model, _, _ = load_model_and_preprocess(
         name="blip2_t5_instruct_lora_with_value_head",
         model_type="flant5xl",
@@ -188,8 +135,23 @@ def main(args):
 
     config = default_ppo_config(model, model_copy, args)
 
+    # -------------------------------
+    # 2) Load dataset
+    # -------------------------------
     dataset = load_dataset(dataset_name, df_path=args.df_path, image_dir=args.image_dir)
 
+    # -------------------------------
+    # 3) Initialize local reward pipeline
+    # -------------------------------
+    # registry.device should be "cuda" or "cpu"
+    if torch.cuda.is_available() and device != -1:
+        registry.device = "cuda"
+    else:
+        registry.device = "cpu"
+    print(f"[ESREAL] Reward registry using device: {registry.device}")
+    registry.initialize()  # loads GDINO, SDXL, CLIP, RewardCalculator, etc.
+
+    to_pil = T.ToPILImage()
 
     @timeit
     def dense_reward_fn(
@@ -198,26 +160,44 @@ def main(args):
         prompts: List[str],
         outputs: List[str],
         tokenizer,
-        **kwargs
+        **kwargs,
     ) -> List[float]:
-        images = images.detach().cpu().numpy()
-        outputs = [str(output) for output in outputs]
-        tokenized_outputs = [[tokenizer.decode(token) for token in tokenizer(output).input_ids] for output in outputs]
+        """
+        This is called by TRLX during PPO.
+        We:
+          - convert images -> PIL
+          - tokenize captions very simply (split on spaces)
+          - call registry.reward_pipeline (your local ESREAL reward)
+          - build per-token dense rewards, same formula as original script.
+        """
 
+        # images: (B, C, H, W) on GPU
+        B = images.shape[0]
+
+        # Convert to list[PIL.Image] on CPU
+        pil_images = [
+            to_pil(images[i].detach().cpu()).convert("RGB") for i in range(B)
+        ]
+
+        # Captions as plain strings
+        captions = [str(o) for o in outputs]
+
+        # Very simple tokenization (same as reward_driver.py / run_reward_local.py)
+        tokenized_outputs = [c.split() for c in captions]
+
+        # Call your local ESREAL reward pipeline
         (
             mean_rec_reward,
             mean_obj_penalty,
             mean_att_penalty,
             mean_rel_penalty,
             mean_pos_penalty,
-        ) = request_reward_model(
-            images,
-            outputs,
-            tokenized_outputs,
-            triton_server_url,
+        ) = registry.reward_pipeline(
+            pil_images,       # List[Image.Image]
+            captions,         # List[str]
+            tokenized_outputs # List[List[str]]
         )
 
-        B = len(images)
         dense_rewards = []
 
         for i in range(B):
@@ -258,37 +238,38 @@ def main(args):
 
         return dense_rewards, reward_dict
 
-
+    # -------------------------------
+    # 4) PPO training with TRLX
+    # -------------------------------
     trlx.train(
         reward_fn=dense_reward_fn,
         prompts=dataset["train"],
         eval_prompts=dataset["val"],
         config=config,
-        triton_server_url=triton_server_url,
         args=args,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--triton_server_url', type=str)
-    parser.add_argument('--model_path', type=str)
-    parser.add_argument('--dataset_name', type=str)
-    parser.add_argument('--df_path', type=str)
-    parser.add_argument('--image_dir', type=str)
-    parser.add_argument('--task_name', type=str, choices=["short_caption", "long_caption", "vqa"])
-    parser.add_argument('--batch_size', type=int)
-    parser.add_argument('--chunk_size', type=int)
-    parser.add_argument('--lr', type=float)
-    parser.add_argument('--seq_length', type=int)
-    parser.add_argument('--max_new_tokens', type=int)
-    parser.add_argument('--repetition_penalty', type=float)
-    parser.add_argument('--init_kl_coef', type=float)
-    parser.add_argument('--alpha', type=float)
-    parser.add_argument('--is_rec_penalty', type=bool)
-    parser.add_argument('--checkpoint_dir', type=str)
-    parser.add_argument('--experiment_name', type=str)
-    parser.add_argument('--resume_from_checkpoint', type=str)
+    # NOTE: triton_server_url removed – we are fully local now
+    parser.add_argument("--model_path", type=str)
+    parser.add_argument("--dataset_name", type=str)
+    parser.add_argument("--df_path", type=str)
+    parser.add_argument("--image_dir", type=str)
+    parser.add_argument("--task_name", type=str, choices=["short_caption", "long_caption", "vqa"])
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--chunk_size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--seq_length", type=int)
+    parser.add_argument("--max_new_tokens", type=int)
+    parser.add_argument("--repetition_penalty", type=float)
+    parser.add_argument("--init_kl_coef", type=float)
+    parser.add_argument("--alpha", type=float)
+    parser.add_argument("--is_rec_penalty", type=bool)
+    parser.add_argument("--checkpoint_dir", type=str)
+    parser.add_argument("--experiment_name", type=str)
+    parser.add_argument("--resume_from_checkpoint", type=str)
     args = parser.parse_args()
 
     args.checkpoint_dir = os.path.join(args.checkpoint_dir, args.experiment_name)
